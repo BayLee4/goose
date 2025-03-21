@@ -39,7 +39,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use xcap::{Monitor, Window};
 
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::WalkBuilder;
 
 // Embeds the prompts directory to the build
 static PROMPTS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/src/developer/prompts");
@@ -92,7 +92,7 @@ pub struct DeveloperRouter {
     prompts: Arc<HashMap<String, Prompt>>,
     instructions: String,
     file_history: Arc<Mutex<HashMap<PathBuf, Vec<String>>>>,
-    ignore_patterns: Arc<Gitignore>,
+    walker_builder: Arc<WalkBuilder>,
 }
 
 impl Default for DeveloperRouter {
@@ -351,8 +351,7 @@ impl DeveloperRouter {
             format!("{base_instructions}\n{hints}")
         };
 
-        let mut builder = GitignoreBuilder::new(cwd.clone());
-        let mut has_ignore_file = false;
+        let mut walk_builder = WalkBuilder::new(Path::new("-"));
         // Initialize ignore patterns
         // - macOS/Linux: ~/.config/goose/
         // - Windows:     ~\AppData\Roaming\Block\goose\config\
@@ -365,31 +364,12 @@ impl DeveloperRouter {
         // Create the directory if it doesn't exist
         let _ = std::fs::create_dir_all(global_ignore_path.parent().unwrap());
 
-        // Read global ignores if they exist
-        if global_ignore_path.is_file() {
-            let _ = builder.add(global_ignore_path);
-            has_ignore_file = true;
-        }
-
-        // Check for local ignores in current directory
-        let local_ignore_path = cwd.join(".gooseignore");
-
-        // Read local ignores if they exist
-        if local_ignore_path.is_file() {
-            let _ = builder.add(local_ignore_path);
-            has_ignore_file = true;
-        }
-
-        // Only use default patterns if no .gooseignore files were found
-        // If the file is empty, we will not ignore any file
-        if !has_ignore_file {
-            // Add some sensible defaults
-            let _ = builder.add_line(None, "**/.env");
-            let _ = builder.add_line(None, "**/.env.*");
-            let _ = builder.add_line(None, "**/secrets.*");
-        }
-
-        let ignore_patterns = builder.build().expect("Failed to build ignore patterns");
+        // Add global ignore patterns
+        walk_builder.add_ignore(global_ignore_path);
+        // Configure the .gooseignore filename as custom ignore filename
+        walk_builder.add_custom_ignore_filename(".gooseignore");
+        // Do not ignore hidden files by default
+        walk_builder.hidden(false);
 
         Self {
             tools: vec![
@@ -402,13 +382,26 @@ impl DeveloperRouter {
             prompts: Arc::new(load_prompt_files()),
             instructions,
             file_history: Arc::new(Mutex::new(HashMap::new())),
-            ignore_patterns: Arc::new(ignore_patterns),
+            walker_builder: Arc::new(walk_builder),
         }
     }
 
     // Helper method to check if a path should be ignored
+    // TODO simplify once the ignore crate allows using ignore::dir and WalkBuilder.ig_ignore
+    // https://github.com/BurntSushi/ripgrep/issues/3014
     fn is_ignored(&self, path: &Path) -> bool {
-        self.ignore_patterns.matched(path, false).is_ignore()
+        let abs_path = std::path::absolute(path).expect("should have an absolute path");
+        if !abs_path.exists() {
+            // Consider non existing paths as not ignored
+            return false;
+        }
+        let mut ignore_builder = (*self.walker_builder).clone();
+        ignore_builder.add(abs_path.parent().unwrap_or(&abs_path));
+        ignore_builder.max_depth(Some(1));
+
+        // If the path exists in the walk result, it's not ignored
+        let ignore_walker = ignore_builder.build();
+        !ignore_walker.filter_map(Result::ok).any(|entry| entry.path() == abs_path)
     }
 
     // Helper method to resolve a path relative to cwd with platform-specific handling
@@ -1087,7 +1080,7 @@ impl Clone for DeveloperRouter {
             prompts: Arc::clone(&self.prompts),
             instructions: self.instructions.clone(),
             file_history: Arc::clone(&self.file_history),
-            ignore_patterns: Arc::clone(&self.ignore_patterns),
+            walker_builder: Arc::clone(&self.walker_builder),
         }
     }
 }
@@ -1484,19 +1477,25 @@ mod tests {
         std::env::set_current_dir(&temp_dir).unwrap();
 
         // Create a DeveloperRouter with custom ignore patterns
-        let mut builder = GitignoreBuilder::new(temp_dir.path().to_path_buf());
-        builder.add_line(None, "secret.txt").unwrap();
-        builder.add_line(None, "*.env").unwrap();
-        let ignore_patterns = builder.build().unwrap();
+        let mut walker = WalkBuilder::new(Path::new("-"));
+        walker.add_custom_ignore_filename(".gooseignore");
 
         let router = DeveloperRouter {
             tools: vec![],
             prompts: Arc::new(HashMap::new()),
             instructions: String::new(),
             file_history: Arc::new(Mutex::new(HashMap::new())),
-            ignore_patterns: Arc::new(ignore_patterns),
+            walker_builder: Arc::new(walker),
         };
 
+        // Create the .gooseignore file
+        let gooseignore = temp_dir.path().join(".gooseignore");
+        std::fs::write(&gooseignore, ["secret.txt", "*.env"].join("\n")).unwrap();
+        // Create test files
+        let _ = std::fs::File::create("secret.txt").unwrap();
+        let _ = std::fs::File::create("not_secret.txt").unwrap();
+        let _ = std::fs::File::create("test.env").unwrap();
+        let _ = std::fs::File::create("test.txt").unwrap();
         // Test basic file matching
         assert!(
             router.is_ignored(Path::new("secret.txt")),
@@ -1535,18 +1534,22 @@ mod tests {
         std::env::set_current_dir(&temp_dir).unwrap();
 
         // Create a DeveloperRouter with custom ignore patterns
-        let mut builder = GitignoreBuilder::new(temp_dir.path().to_path_buf());
-        builder.add_line(None, "secret.txt").unwrap();
-        let ignore_patterns = builder.build().unwrap();
+        let mut walker = WalkBuilder::new(Path::new("-"));
+        walker.add_custom_ignore_filename(".gooseignore");
 
         let router = DeveloperRouter {
             tools: DeveloperRouter::new().tools, // Reuse default tools
             prompts: Arc::new(HashMap::new()),
             instructions: String::new(),
             file_history: Arc::new(Mutex::new(HashMap::new())),
-            ignore_patterns: Arc::new(ignore_patterns),
+            walker_builder: Arc::new(walker),
         };
 
+        // Create the .gooseignore file
+        let gooseignore = temp_dir.path().join(".gooseignore");
+        std::fs::write(&gooseignore, "secret.txt").unwrap();
+        // Create test file
+        let _ = std::fs::File::create("secret.txt").unwrap();
         // Try to write to an ignored file
         let result = router
             .call_tool(
@@ -1592,17 +1595,20 @@ mod tests {
         std::env::set_current_dir(&temp_dir).unwrap();
 
         // Create a DeveloperRouter with custom ignore patterns
-        let mut builder = GitignoreBuilder::new(temp_dir.path().to_path_buf());
-        builder.add_line(None, "secret.txt").unwrap();
-        let ignore_patterns = builder.build().unwrap();
+        let mut walker = WalkBuilder::new(Path::new("-"));
+        walker.add_custom_ignore_filename(".gooseignore");
 
         let router = DeveloperRouter {
             tools: DeveloperRouter::new().tools, // Reuse default tools
             prompts: Arc::new(HashMap::new()),
             instructions: String::new(),
             file_history: Arc::new(Mutex::new(HashMap::new())),
-            ignore_patterns: Arc::new(ignore_patterns),
+            walker_builder: Arc::new(walker),
         };
+
+        // Create the .gooseignore file
+        let gooseignore = temp_dir.path().join(".gooseignore");
+        std::fs::write(&gooseignore, "secret.txt").unwrap();
 
         // Create an ignored file
         let secret_file_path = temp_dir.path().join("secret.txt");
